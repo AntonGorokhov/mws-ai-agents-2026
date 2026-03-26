@@ -1,0 +1,2 @@
+[console_scripts]
+kaggle-agents = src.main:main
