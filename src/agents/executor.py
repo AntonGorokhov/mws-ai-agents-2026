@@ -55,9 +55,12 @@ def _strip_redefinitions(code: str, prefix_vars: list[str]) -> str:
 def _auto_fix(code: str) -> str:
     """Fix common LLM code generation mistakes."""
     # Fix deprecated squared=False in mean_squared_error
-    code = code.replace("mean_squared_error(y_val, val_pred, squared=False)", "np.sqrt(mean_squared_error(y_val, val_pred))")
-    code = code.replace("mean_squared_error(y_val, val_preds, squared=False)", "np.sqrt(mean_squared_error(y_val, val_preds))")
     code = re.sub(r"mean_squared_error\(([^)]+),\s*squared\s*=\s*False\)", r"np.sqrt(mean_squared_error(\1))", code)
+    # Fix LGBMRegressor.fit() verbose argument (not supported, use log_evaluation callback)
+    code = re.sub(r"(lgb\.LGBMRegressor[^)]*\.fit\([^)]*),\s*verbose\s*=\s*\d+", r"\1", code)
+    code = re.sub(r"(lgb\.LGBMClassifier[^)]*\.fit\([^)]*),\s*verbose\s*=\s*\d+", r"\1", code)
+    # Also fix if verbose is passed as first-ish kwarg
+    code = re.sub(r"\.fit\(([^)]*?)verbose\s*=\s*(?:0|False|-1)\s*,?\s*", r".fit(\1", code)
     return code
 
 

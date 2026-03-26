@@ -41,8 +41,21 @@ us_holidays = [...]  # list of holiday dates
 df['is_holiday'] = df['dt'].dt.date.isin(us_holidays).astype(int)
 ```
 
+## Critical: Feature Extraction Order
+- ALWAYS extract all features from a datetime column BEFORE dropping it
+- Wrong: drop last_dt → try to extract year/month → fail (column gone)
+- Right: extract year/month/days_since → then drop last_dt
+- Put datetime source columns in a separate "drop_after_features" list, not in "drop_columns"
+
+## Missing Datetime as Signal
+- Missing dates are often highly informative
+- Example: no last_review_date = listing has zero reviews = likely different availability pattern
+- Create `has_date` binary feature BEFORE filling NaN
+- Missing datetime correlates with other missing fields (e.g., avg_reviews)
+- This pattern is especially important for zero-inflated targets
+
 ## Tips
 - Always check for timezone issues
-- Missing dates may be informative — create `has_date` binary feature
 - For tree models: raw month/day/hour features work well without cyclical encoding
-- Drop the original datetime column after feature extraction
+- Use a fixed reference date for "days since" features (e.g., '2020-01-01'), not pd.Timestamp.now()
+- Drop the original datetime column AFTER feature extraction (not before)

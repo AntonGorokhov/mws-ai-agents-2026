@@ -56,8 +56,11 @@ def analyst_agent(state: PipelineState) -> PipelineState:
     # Build data profile
     profile = _build_data_profile(competition_dir, target_column)
 
-    # RAG context
-    rag_context = rag_query("feature engineering categorical numerical datetime missing values model selection regression", "ml_knowledge", top_k=5)
+    # RAG context — include zero-inflated and datetime topics
+    rag_context = rag_query(
+        "zero-inflated two-stage classification regression datetime feature engineering categorical missing values",
+        "ml_knowledge", top_k=8
+    )
 
     prev_scores = state.get("cv_scores", [])
     prev_errors = state.get("errors", [])
@@ -68,11 +71,13 @@ def analyst_agent(state: PipelineState) -> PipelineState:
         "Output ONLY valid JSON (no markdown fences, no explanation) with this structure:\n"
         "{\n"
         '  "drop_columns": ["col1", "col2"],\n'
+        '  "drop_after_features": ["datetime_col"],\n'
         '  "features": [\n'
         '    {"name": "feature_name", "formula": "pandas expression", "description": "why"}\n'
         '  ],\n'
         '  "categorical_encoding": {"col": "method"},\n'
         '  "fill_na": {"col": "strategy"},\n'
+        '  "two_stage": {"enabled": true/false, "zero_threshold": 0},\n'
         '  "model_params": {\n'
         '    "lgbm": {"num_leaves": 63, "learning_rate": 0.05, "n_estimators": 2000, ...},\n'
         '    "xgb": {"max_depth": 6, "learning_rate": 0.05, "n_estimators": 2000, ...},\n'
@@ -83,17 +88,21 @@ def analyst_agent(state: PipelineState) -> PipelineState:
         '  "ensemble_method": "weighted_average"\n'
         "}\n\n"
         "RULES:\n"
-        "- Drop columns that are too unique (names, IDs) or not useful.\n"
-        "- For datetime columns: extract year, month, day_of_week, days_since.\n"
-        "- For categorical: use 'label' (low cardinality), 'frequency' (high cardinality), or 'onehot'.\n"
+        "- drop_columns: columns to drop IMMEDIATELY (IDs, names, useless).\n"
+        "- drop_after_features: datetime/string columns to drop AFTER extracting features from them.\n"
+        "  NEVER put datetime columns in drop_columns if you plan to extract features from them!\n"
+        "- For datetime columns: extract year, month, day_of_week, days_since_reference, has_date flag.\n"
+        "- For categorical: use 'label' (low cardinality), 'frequency' (high cardinality), or 'target' encoding.\n"
         "- fill_na: 'median', 'zero', 'mode', or 'missing' (for categoricals).\n"
-        "- Consider the target distribution when choosing target_transform.\n"
+        "- two_stage: if target has >20% zeros, set enabled=true. This trains a classifier (zero/non-zero)\n"
+        "  then a regressor on non-zero samples. Final pred = P(non_zero) * regression_pred.\n"
+        "- The competition metric is MSE. Optimize for it.\n"
         "- Set clip_predictions based on target min/max.\n"
     )
 
     user_prompt = f"Data profile:\n{profile}\n\n"
     if rag_context:
-        user_prompt += f"ML Knowledge:\n{rag_context[:2000]}\n\n"
+        user_prompt += f"ML Knowledge:\n{rag_context[:3000]}\n\n"
     if iteration > 0 and reviewer_feedback:
         user_prompt += f"Previous iteration feedback:\n{reviewer_feedback}\n"
         user_prompt += f"Previous CV scores: {prev_scores}\n"
@@ -113,9 +122,18 @@ def analyst_agent(state: PipelineState) -> PipelineState:
     # Parse JSON — try to extract from response
     plan = _parse_json_plan(raw)
 
-    logger.info("[analyst] Plan generated: %d features, models: %s",
+    # Ensure two_stage field exists
+    if "two_stage" not in plan:
+        plan["two_stage"] = {"enabled": False, "zero_threshold": 0}
+
+    # Ensure drop_after_features exists
+    if "drop_after_features" not in plan:
+        plan["drop_after_features"] = []
+
+    logger.info("[analyst] Plan generated: %d features, models: %s, two_stage: %s",
                 len(plan.get("features", [])),
-                list(plan.get("model_params", {}).keys()))
+                list(plan.get("model_params", {}).keys()),
+                plan.get("two_stage", {}).get("enabled", False))
 
     new_state = {**state}
     new_state["analyst_plan"] = json.dumps(plan, default=str)
@@ -162,20 +180,30 @@ def _parse_json_plan(raw: str) -> dict:
 def _default_plan() -> dict:
     return {
         "drop_columns": ["name", "_id", "host_name"],
+        "drop_after_features": ["last_dt"],
         "features": [
+            {"name": "last_dt_year", "formula": "pd.to_datetime(df['last_dt'], errors='coerce').dt.year", "description": "year of last review"},
+            {"name": "last_dt_month", "formula": "pd.to_datetime(df['last_dt'], errors='coerce').dt.month", "description": "month of last review"},
+            {"name": "last_dt_dayofweek", "formula": "pd.to_datetime(df['last_dt'], errors='coerce').dt.dayofweek", "description": "day of week"},
+            {"name": "days_since_last_review", "formula": "(pd.Timestamp('2020-01-01') - pd.to_datetime(df['last_dt'], errors='coerce')).dt.days", "description": "recency"},
+            {"name": "has_last_review", "formula": "df['last_dt'].notna().astype(int)", "description": "has any review"},
             {"name": "log_sum", "formula": "np.log1p(df['sum'])", "description": "log price"},
             {"name": "log_amt_reviews", "formula": "np.log1p(df['amt_reviews'])", "description": "log reviews"},
             {"name": "reviews_per_host", "formula": "df['amt_reviews'] / (df['total_host'] + 1)", "description": "reviews ratio"},
         ],
         "categorical_encoding": {
-            "location_cluster": "onehot",
-            "type_house": "onehot",
+            "location_cluster": "label",
+            "type_house": "label",
             "location": "frequency",
         },
         "fill_na": {
             "avg_reviews": "zero",
-            "last_dt": "missing",
+            "days_since_last_review": "median",
+            "last_dt_year": "median",
+            "last_dt_month": "median",
+            "last_dt_dayofweek": "median",
         },
+        "two_stage": {"enabled": True, "zero_threshold": 0},
         "model_params": {
             "lgbm": {"num_leaves": 63, "learning_rate": 0.05, "n_estimators": 2000},
             "xgb": {"max_depth": 6, "learning_rate": 0.05, "n_estimators": 2000},
