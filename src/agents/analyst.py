@@ -88,7 +88,8 @@ def analyst_agent(state: PipelineState) -> PipelineState:
         '  "ensemble_method": "weighted_average"\n'
         "}\n\n"
         "RULES:\n"
-        "- drop_columns: columns to drop IMMEDIATELY (IDs, names, useless).\n"
+        "- drop_columns: columns to drop IMMEDIATELY (names, useless).\n"
+        "- IMPORTANT: keep _id as feature if it correlates with target (it's a proxy for listing age).\n"
         "- drop_after_features: datetime/string columns to drop AFTER extracting features from them.\n"
         "  NEVER put datetime columns in drop_columns if you plan to extract features from them!\n"
         "- For datetime columns: extract year, month, day_of_week, days_since_reference, has_date flag.\n"
@@ -183,7 +184,7 @@ def _parse_json_plan(raw: str) -> dict:
 
 def _default_plan() -> dict:
     return {
-        "drop_columns": ["name", "_id"],
+        "drop_columns": ["name"],
         "drop_after_features": ["last_dt", "host_name"],
         "features": [
             {"name": "last_dt_year", "formula": "pd.to_datetime(df['last_dt'], errors='coerce').dt.year", "description": "year of last review"},
@@ -200,7 +201,7 @@ def _default_plan() -> dict:
             {"name": "avg_reviews_missing", "formula": "df['avg_reviews'].isna().astype(int)", "description": "missing review indicator"},
         ],
         "categorical_encoding": {
-            "location_cluster": "target",
+            "location_cluster": "label",
             "type_house": "label",
             "location": "target",
             "host_name": "target",
