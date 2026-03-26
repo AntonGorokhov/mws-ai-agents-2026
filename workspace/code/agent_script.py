@@ -19,278 +19,310 @@ import xgboost as xgb
 from catboost import CatBoostRegressor
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import LabelEncoder
 import pickle
 
 train_df = pd.read_csv(TRAIN_INPUT)
 test_df = pd.read_csv(TEST_INPUT)
 
-# Feature Engineering on both datasets
-for df in [train_df, test_df]:
-    df['last_dt_year'] = pd.to_datetime(df['last_dt'], errors='coerce').dt.year
-    df['last_dt_month'] = pd.to_datetime(df['last_dt'], errors='coerce').dt.month
-    df['last_dt_day_of_week'] = pd.to_datetime(df['last_dt'], errors='coerce').dt.dayofweek
-    df['days_since_last_review'] = (pd.Timestamp('2020-01-01') - pd.to_datetime(df['last_dt'], errors='coerce')).dt.days
-    df['has_last_review'] = df['last_dt'].notna().astype(int)
-    df['lat_lon_interaction'] = df['lat'] * df['lon']
-    df['reviews_per_day'] = df['amt_reviews'] / (df['days_since_last_review'] + 1)
-    df['price_per_person_est'] = df['sum'] / (df['total_host'] + 1)
-    df['host_experience'] = df['total_host'] * df['amt_reviews']
+# Combine for feature engineering
+all_df = pd.concat([train_df, test_df], axis=0, ignore_index=True)
+
+# Feature Engineering
+all_df['has_last_review'] = all_df['last_dt'].notna().astype(int)
+all_df['last_review_year'] = pd.to_datetime(all_df['last_dt'], errors='coerce').dt.year
+all_df['last_review_month'] = pd.to_datetime(all_df['last_dt'], errors='coerce').dt.month
+all_df['last_review_day_of_week'] = pd.to_datetime(all_df['last_dt'], errors='coerce').dt.dayofweek
+all_df['days_since_last_review'] = (pd.Timestamp('2020-01-01') - pd.to_datetime(all_df['last_dt'], errors='coerce')).dt.days
+all_df['host_listing_count'] = all_df.groupby('host_name')['host_name'].transform('count')
+all_df['lat_lon_interaction'] = all_df['lat'] * all_df['lon']
+all_df['distance_from_center'] = np.sqrt((all_df['lat'] - 40.7128)**2 + (all_df['lon'] - (-74.0060))**2)
+all_df['price_per_day'] = all_df['sum'] / (all_df['min_days'] + 1)
+all_df['review_density'] = all_df['amt_reviews'] / (all_df['total_host'] + 1)
+all_df['avg_reviews_missing'] = all_df['avg_reviews'].isna().astype(int)
+
+# Target Encoding for location and host_name with CV and smoothing
+global_mean = train_df[TARGET_COLUMN].mean()
+
+def target_encode_cv(train_df, test_df, column, target_col, smoothing):
+    # Initialize new columns
+    train_df[f'{column}_target_enc'] = np.nan
+    test_df[f'{column}_target_enc'] = np.nan
+    
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    train_df = train_df.reset_index(drop=True)
+    
+    for train_idx, val_idx in kf.split(train_df):
+        # Compute means from out-of-fold data
+        means = train_df.iloc[train_idx].groupby(column)[target_col].agg(['mean', 'count'])
+        # Apply smoothing
+        smoothed = (means['count'] * means['mean'] + smoothing * global_mean) / (means['count'] + smoothing)
+        smoothed_dict = smoothed.to_dict()
+        
+        # Map to validation set
+        train_df.loc[val_idx, f'{column}_target_enc'] = train_df.loc[val_idx, column].map(smoothed_dict).fillna(global_mean)
+    
+    # For test set, use full train data
+    means_full = train_df.groupby(column)[target_col].agg(['mean', 'count'])
+    smoothed_full = (means_full['count'] * means_full['mean'] + smoothing * global_mean) / (means_full['count'] + smoothing)
+    smoothed_full_dict = smoothed_full.to_dict()
+    test_df[f'{column}_target_enc'] = test_df[column].map(smoothed_full_dict).fillna(global_mean)
+    
+    return train_df, test_df
+
+# Apply target encoding BEFORE dropping the columns
+train_part = all_df.iloc[:len(train_df)].copy()
+test_part = all_df.iloc[len(train_df):].copy()
+
+# For location
+train_part, test_part = target_encode_cv(train_part, test_part, 'location', TARGET_COLUMN, smoothing=10)
+# For host_name
+train_part, test_part = target_encode_cv(train_part, test_part, 'host_name', TARGET_COLUMN, smoothing=20)
+
+# Combine back
+all_df = pd.concat([train_part, test_part], axis=0, ignore_index=True)
 
 # Drop specified columns
-drop_cols = ["name", "_id"]
-train_df.drop(columns=drop_cols, inplace=True, errors='ignore')
-test_df.drop(columns=drop_cols, inplace=True, errors='ignore')
+drop_cols = ["_id"]
+all_df.drop(columns=drop_cols, inplace=True, errors='ignore')
 
-# Drop datetime source columns after feature extraction
-drop_after = ["last_dt"]
-train_df.drop(columns=drop_after, inplace=True, errors='ignore')
-test_df.drop(columns=drop_after, inplace=True, errors='ignore')
+# Drop after features (now safe since we've already done target encoding)
+drop_after_features = ["name", "host_name", "last_dt"]
+all_df.drop(columns=drop_after_features, inplace=True, errors='ignore')
 
 # Categorical Encoding
-freq_enc_cols = []
-label_enc_cols = []
+# Label Encoding for location_cluster and type_house
+for col in ['location_cluster', 'type_house']:
+    le = LabelEncoder()
+    all_df[col] = le.fit_transform(all_df[col].astype(str))
 
-for col, method in {
-    "host_name": "frequency",
-    "location_cluster": "label",
-    "location": "frequency",
-    "type_house": "label"
-}.items():
-    if method == "frequency":
-        freq_map = train_df[col].value_counts().to_dict()
-        train_df[col + '_freq'] = train_df[col].map(freq_map)
-        test_df[col + '_freq'] = test_df[col].map(freq_map)
-        freq_enc_cols.append(col + '_freq')
-    elif method == "label":
-        combined = pd.concat([train_df[[col]], test_df[[col]]], ignore_index=True)
-        labels = combined[col].astype('category').cat.codes
-        label_map = dict(zip(combined[col].values, labels))
-        train_df[col] = train_df[col].map(label_map)
-        test_df[col] = test_df[col].map(label_map)
-        label_enc_cols.append(col)
+# Frequency Encoding for location
+freq_map = all_df['location'].value_counts(normalize=True).to_dict()
+all_df['location_freq'] = all_df['location'].map(freq_map)
 
 # Fill NaN values
 fill_na_config = {
-    "last_dt_year": "median",
-    "last_dt_month": "median",
-    "last_dt_day_of_week": "median",
+    "last_review_year": "median",
+    "last_review_month": "median",
+    "last_review_day_of_week": "median",
     "days_since_last_review": "median",
-    "avg_reviews": "zero"
+    "avg_reviews": "median",
+    "location": "missing",
+    "type_house": "missing"
 }
 
-for col, strategy in fill_na_config.items():
-    if strategy == "median":
-        median_val = train_df[col].median()
-        train_df[col].fillna(median_val, inplace=True)
-        test_df[col].fillna(median_val, inplace=True)
-    elif strategy == "zero":
-        train_df[col].fillna(0, inplace=True)
-        test_df[col].fillna(0, inplace=True)
+for col, method in fill_na_config.items():
+    if method == "median":
+        all_df[col] = all_df[col].fillna(all_df[col].median())
+    elif method == "missing":
+        all_df[col] = all_df[col].fillna("missing")
 
-# Remove all object columns
-train_df = train_df.select_dtypes(exclude=['object'])
-test_df = test_df.select_dtypes(exclude=['object'])
+# Drop any remaining object columns
+numeric_df = all_df.select_dtypes(exclude=['object'])
+# Ensure we have the target column
+if TARGET_COLUMN not in numeric_df.columns and TARGET_COLUMN in all_df.columns:
+    numeric_df[TARGET_COLUMN] = all_df[TARGET_COLUMN]
 
-# Align columns
-common_cols = sorted(list(set(train_df.columns) & set(test_df.columns)))
-if TARGET_COLUMN in common_cols:
-    common_cols.remove(TARGET_COLUMN)
-train_df = train_df[common_cols + [TARGET_COLUMN]]
-test_df = test_df[common_cols]
+# Align train/test columns
+common_cols = sorted(list(set(numeric_df.columns)))
+train_df_processed = numeric_df.iloc[:len(train_df)][common_cols]
+test_df_processed = numeric_df.iloc[len(train_df):][common_cols]
 
-X_train = train_df.drop(columns=[TARGET_COLUMN])
-y_train = train_df[TARGET_COLUMN]
-X_test = test_df.copy()
+# Prepare final datasets
+X_train = train_df_processed.drop(columns=[TARGET_COLUMN])
+y_train = train_df_processed[TARGET_COLUMN]
+X_test = test_df_processed.drop(columns=[TARGET_COLUMN])
 
 # Two-stage modeling
-# Stage 1: Classifier to predict zero vs non-zero
+# Stage 1: Classifier
 y_binary = (y_train > 0).astype(int)
-
-lgbm_clf = lgb.LGBMClassifier(
-    objective='binary',
-    n_estimators=1000,
-    num_leaves=63,
-    learning_rate=0.05,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    reg_alpha=0.1,
-    reg_lambda=0.1,
-    random_state=42
-)
-
+classifier_probas = np.zeros(len(X_test))
 kf = KFold(n_splits=5, shuffle=True, random_state=42)
-clf_scores = []
-clf_oof_preds = np.zeros(len(X_train))
-clf_test_preds = np.zeros(len(X_test))
 
-for train_idx, val_idx in kf.split(X_train):
-    X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
-    y_tr, y_val = y_binary.iloc[train_idx], y_binary.iloc[val_idx]
-    
-    lgbm_clf.fit(
-        X_tr, y_tr,
-        eval_set=[(X_val, y_val)],
-        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)]
-    )
-    
-    val_pred = lgbm_clf.predict_proba(X_val)[:, 1]
-    clf_oof_preds[val_idx] = val_pred
-    clf_test_preds += lgbm_clf.predict_proba(X_test)[:, 1] / 5
-    
-    mse = mean_squared_error(y_val, val_pred)
-    clf_scores.append(mse)
+clf_params = {
+    'objective': 'binary',
+    'n_estimators': 1000,
+    'random_state': 42,
+    'n_jobs': -1
+}
 
-print(f"MSE (Classifier): {np.mean(clf_scores)}")
-
-# Stage 2: Regression on non-zero samples only
-mask = y_train > 0
-X_reg_train = X_train[mask]
-y_reg_train = y_train[mask]
-
-models = {}
-reg_test_preds = []
-
-# LightGBM Regressor
+mse_scores_clf = []
 try:
-    lgb_model = lgb.LGBMRegressor(**{
-        "num_leaves": 63,
-        "learning_rate": 0.05,
-        "n_estimators": 2000,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "reg_alpha": 0.1,
-        "reg_lambda": 0.1,
-        "random_state": 42
-    })
-    
-    lgb_scores = []
-    lgb_oof_preds = np.zeros(len(X_reg_train))
-    lgb_test_pred = np.zeros(len(X_test))
-    
-    kf_reg = KFold(n_splits=5, shuffle=True, random_state=42)
-    for train_idx, val_idx in kf_reg.split(X_reg_train):
-        X_tr, X_val = X_reg_train.iloc[train_idx], X_reg_train.iloc[val_idx]
-        y_tr, y_val = y_reg_train.iloc[train_idx], y_reg_train.iloc[val_idx]
+    for train_idx, val_idx in kf.split(X_train):
+        X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+        y_tr, y_val = y_binary.iloc[train_idx], y_binary.iloc[val_idx]
         
-        lgb_model.fit(
+        clf = lgb.LGBMClassifier(**clf_params)
+        clf.fit(
             X_tr, y_tr,
             eval_set=[(X_val, y_val)],
             callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)]
         )
         
-        val_pred = lgb_model.predict(X_val)
-        lgb_oof_preds[val_idx] = val_pred
-        lgb_test_pred += lgb_model.predict(X_test) / 5
+        preds = clf.predict_proba(X_val)[:, 1]
+        mse = mean_squared_error(y_val, preds)
+        mse_scores_clf.append(mse)
         
-        mse = mean_squared_error(y_val, val_pred)
-        lgb_scores.append(mse)
-    
-    print(f"MSE (LGBM Regressor): {np.mean(lgb_scores)}")
-    models['lgb'] = lgb_model
-    reg_test_preds.append(lgb_test_pred)
+        classifier_probas += clf.predict_proba(X_test)[:, 1] / 5
+        
+    print(f"MSE (Classifier): {np.mean(mse_scores_clf)}")
 except Exception as e:
-    print("Error training LGBM:", e)
+    print(f"Classifier failed: {e}")
+
+# Stage 2: Regressor on non-zero samples only
+mask = y_train > 0
+X_train_reg = X_train[mask]
+y_train_reg = y_train[mask]
+
+reg_models = {}
+predictions = []
+
+# LGBM Regressor
+try:
+    lgb_params = {
+        'num_leaves': 63,
+        'learning_rate': 0.05,
+        'n_estimators': 2000,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'reg_alpha': 0.1,
+        'reg_lambda': 0.1,
+        'random_state': 42,
+        'n_jobs': -1
+    }
+    
+    lgb_preds = np.zeros(len(X_test))
+    kf_reg = KFold(n_splits=5, shuffle=True, random_state=42)
+    mse_scores_lgb = []
+    
+    for train_idx, val_idx in kf_reg.split(X_train_reg):
+        X_tr, X_val = X_train_reg.iloc[train_idx], X_train_reg.iloc[val_idx]
+        y_tr, y_val = y_train_reg.iloc[train_idx], y_train_reg.iloc[val_idx]
+        
+        model = lgb.LGBMRegressor(**lgb_params)
+        model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
+            callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)]
+        )
+        
+        preds = model.predict(X_val)
+        mse = mean_squared_error(y_val, preds)
+        mse_scores_lgb.append(mse)
+        
+        lgb_preds += model.predict(X_test) / 5
+        
+    print(f"MSE (LGBM Regressor): {np.mean(mse_scores_lgb)}")
+    predictions.append(lgb_preds)
+    reg_models['lgb'] = model
+except Exception as e:
+    print(f"LGBM Regressor failed: {e}")
 
 # XGBoost Regressor
 try:
-    xgb_model = xgb.XGBRegressor(**{
-        "max_depth": 6,
-        "learning_rate": 0.05,
-        "n_estimators": 2000,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "reg_alpha": 0.1,
-        "reg_lambda": 0.1,
-        "random_state": 42,
-        "early_stopping_rounds": 100,
-        "verbosity": 0
-    })
+    xgb_params = {
+        'max_depth': 6,
+        'learning_rate': 0.05,
+        'n_estimators': 2000,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'reg_alpha': 0.1,
+        'reg_lambda': 0.1,
+        'random_state': 42,
+        'n_jobs': -1,
+        'early_stopping_rounds': 100
+    }
     
-    xgb_scores = []
-    xgb_oof_preds = np.zeros(len(X_reg_train))
-    xgb_test_pred = np.zeros(len(X_test))
-    
+    xgb_preds = np.zeros(len(X_test))
     kf_reg = KFold(n_splits=5, shuffle=True, random_state=42)
-    for train_idx, val_idx in kf_reg.split(X_reg_train):
-        X_tr, X_val = X_reg_train.iloc[train_idx], X_reg_train.iloc[val_idx]
-        y_tr, y_val = y_reg_train.iloc[train_idx], y_reg_train.iloc[val_idx]
+    mse_scores_xgb = []
+    
+    for train_idx, val_idx in kf_reg.split(X_train_reg):
+        X_tr, X_val = X_train_reg.iloc[train_idx], X_train_reg.iloc[val_idx]
+        y_tr, y_val = y_train_reg.iloc[train_idx], y_train_reg.iloc[val_idx]
         
-        xgb_model.fit(
+        model = xgb.XGBRegressor(**xgb_params)
+        model.fit(
             X_tr, y_tr,
             eval_set=[(X_val, y_val)],
             verbose=0
         )
         
-        val_pred = xgb_model.predict(X_val)
-        xgb_oof_preds[val_idx] = val_pred
-        xgb_test_pred += xgb_model.predict(X_test) / 5
+        preds = model.predict(X_val)
+        mse = mean_squared_error(y_val, preds)
+        mse_scores_xgb.append(mse)
         
-        mse = mean_squared_error(y_val, val_pred)
-        xgb_scores.append(mse)
-    
-    print(f"MSE (XGB Regressor): {np.mean(xgb_scores)}")
-    models['xgb'] = xgb_model
-    reg_test_preds.append(xgb_test_pred)
+        xgb_preds += model.predict(X_test) / 5
+        
+    print(f"MSE (XGB Regressor): {np.mean(mse_scores_xgb)}")
+    predictions.append(xgb_preds)
+    reg_models['xgb'] = model
 except Exception as e:
-    print("Error training XGBoost:", e)
+    print(f"XGB Regressor failed: {e}")
 
 # CatBoost Regressor
 try:
-    cb_model = CatBoostRegressor(**{
-        "depth": 6,
-        "learning_rate": 0.05,
-        "iterations": 2000,
-        "l2_leaf_reg": 3,
-        "random_strength": 1,
-        "random_state": 42,
-        "verbose": 0,
-        "early_stopping_rounds": 100
-    })
+    cb_params = {
+        'depth': 6,
+        'learning_rate': 0.05,
+        'iterations': 2000,
+        'l2_leaf_reg': 3,
+        'random_strength': 1,
+        'bagging_temperature': 0.8,
+        'random_seed': 42,
+        'thread_count': -1,
+        'verbose': 0,
+        'early_stopping_rounds': 100
+    }
     
-    cb_scores = []
-    cb_oof_preds = np.zeros(len(X_reg_train))
-    cb_test_pred = np.zeros(len(X_test))
-    
+    cb_preds = np.zeros(len(X_test))
     kf_reg = KFold(n_splits=5, shuffle=True, random_state=42)
-    for train_idx, val_idx in kf_reg.split(X_reg_train):
-        X_tr, X_val = X_reg_train.iloc[train_idx], X_reg_train.iloc[val_idx]
-        y_tr, y_val = y_reg_train.iloc[train_idx], y_reg_train.iloc[val_idx]
+    mse_scores_cb = []
+    
+    for train_idx, val_idx in kf_reg.split(X_train_reg):
+        X_tr, X_val = X_train_reg.iloc[train_idx], X_train_reg.iloc[val_idx]
+        y_tr, y_val = y_train_reg.iloc[train_idx], y_train_reg.iloc[val_idx]
         
-        cb_model.fit(
+        model = CatBoostRegressor(**cb_params)
+        model.fit(
             X_tr, y_tr,
             eval_set=(X_val, y_val),
             verbose=0
         )
         
-        val_pred = cb_model.predict(X_val)
-        cb_oof_preds[val_idx] = val_pred
-        cb_test_pred += cb_model.predict(X_test) / 5
+        preds = model.predict(X_val)
+        mse = mean_squared_error(y_val, preds)
+        mse_scores_cb.append(mse)
         
-        mse = mean_squared_error(y_val, val_pred)
-        cb_scores.append(mse)
-    
-    print(f"MSE (CatBoost Regressor): {np.mean(cb_scores)}")
-    models['catboost'] = cb_model
-    reg_test_preds.append(cb_test_pred)
+        cb_preds += model.predict(X_test) / 5
+        
+    print(f"MSE (CatBoost Regressor): {np.mean(mse_scores_cb)}")
+    predictions.append(cb_preds)
+    reg_models['catboost'] = model
 except Exception as e:
-    print("Error training CatBoost:", e)
+    print(f"CatBoost Regressor failed: {e}")
 
-# Ensemble regression predictions
-if len(reg_test_preds) > 0:
-    avg_reg_pred = np.mean(np.array(reg_test_preds), axis=0)
+# Ensemble regression predictions (simple average)
+if len(predictions) > 0:
+    reg_pred = np.mean(np.array(predictions), axis=0)
 else:
-    # fallback if no regressors succeeded
-    avg_reg_pred = np.zeros(len(X_test))
+    # Fallback if all regressors fail
+    reg_pred = np.full(len(X_test), y_train_reg.mean())
 
-# Final prediction combining classifier and regressor
-final_pred = clf_test_preds * avg_reg_pred
+# Combine classifier and regressor
+final_pred = classifier_probas * reg_pred
+
+# Clip predictions
 final_pred = np.clip(final_pred, 0, 365)
 
-submission = pd.DataFrame({
-    'index': test_df.index,
-    TARGET_COLUMN: final_pred
-})
+# Save submission
+submission = pd.DataFrame({TARGET_COLUMN: final_pred})
 submission.to_csv(SUBMISSION_PATH, index=False)
 
+# Save models
 with open(MODEL_PATH, 'wb') as f:
-    pickle.dump(models, f)
+    pickle.dump({
+        'classifier': clf if 'clf' in locals() else None,
+        'regressors': reg_models,
+        'columns': list(X_train.columns)
+    }, f)

@@ -23,7 +23,7 @@ def run_sandboxed(code: str, cwd: str, timeout: int = CODE_TIMEOUT_S) -> dict:
             logger.warning(msg)
             return {"ok": False, "stdout": "", "stderr": "", "error": msg}
 
-    code_dir = Path(cwd) / "code"
+    code_dir = Path(cwd).resolve() / "code"
     code_dir.mkdir(parents=True, exist_ok=True)
     script_path = code_dir / "agent_script.py"
     script_path.write_text(code)

@@ -92,7 +92,11 @@ def analyst_agent(state: PipelineState) -> PipelineState:
         "- drop_after_features: datetime/string columns to drop AFTER extracting features from them.\n"
         "  NEVER put datetime columns in drop_columns if you plan to extract features from them!\n"
         "- For datetime columns: extract year, month, day_of_week, days_since_reference, has_date flag.\n"
-        "- For categorical: use 'label' (low cardinality), 'frequency' (high cardinality), or 'target' encoding.\n"
+        "- For categorical: use 'label' (low cardinality ≤15), 'frequency' (medium), or 'target' encoding (high cardinality >15).\n"
+        "- IMPORTANT: For high-cardinality categoricals like location/neighbourhood (>15 unique values), use 'target' encoding.\n"
+        "  Target encoding replaces category with smoothed mean of target using CV to avoid leakage.\n"
+        "- For host-level features: compute host_target_mean, host_listing_count as aggregation features.\n"
+        "  Put host_name in drop_after_features (NOT drop_columns) so aggregation can be computed first.\n"
         "- fill_na: 'median', 'zero', 'mode', or 'missing' (for categoricals).\n"
         "- two_stage: if target has >20% zeros, set enabled=true. This trains a classifier (zero/non-zero)\n"
         "  then a regressor on non-zero samples. Final pred = P(non_zero) * regression_pred.\n"
@@ -179,8 +183,8 @@ def _parse_json_plan(raw: str) -> dict:
 
 def _default_plan() -> dict:
     return {
-        "drop_columns": ["name", "_id", "host_name"],
-        "drop_after_features": ["last_dt"],
+        "drop_columns": ["name", "_id"],
+        "drop_after_features": ["last_dt", "host_name"],
         "features": [
             {"name": "last_dt_year", "formula": "pd.to_datetime(df['last_dt'], errors='coerce').dt.year", "description": "year of last review"},
             {"name": "last_dt_month", "formula": "pd.to_datetime(df['last_dt'], errors='coerce').dt.month", "description": "month of last review"},
@@ -190,11 +194,16 @@ def _default_plan() -> dict:
             {"name": "log_sum", "formula": "np.log1p(df['sum'])", "description": "log price"},
             {"name": "log_amt_reviews", "formula": "np.log1p(df['amt_reviews'])", "description": "log reviews"},
             {"name": "reviews_per_host", "formula": "df['amt_reviews'] / (df['total_host'] + 1)", "description": "reviews ratio"},
+            {"name": "price_per_min_nights", "formula": "df['sum'] / (df['min_days'].clip(lower=1))", "description": "price per minimum night"},
+            {"name": "host_listing_count", "formula": "df.groupby('host_name')['host_name'].transform('count')", "description": "number of listings per host"},
+            {"name": "distance_from_center", "formula": "np.sqrt((df['lat'] - 40.7128)**2 + (df['lon'] + 74.0060)**2)", "description": "distance from NYC center"},
+            {"name": "avg_reviews_missing", "formula": "df['avg_reviews'].isna().astype(int)", "description": "missing review indicator"},
         ],
         "categorical_encoding": {
-            "location_cluster": "label",
+            "location_cluster": "target",
             "type_house": "label",
-            "location": "frequency",
+            "location": "target",
+            "host_name": "target",
         },
         "fill_na": {
             "avg_reviews": "zero",

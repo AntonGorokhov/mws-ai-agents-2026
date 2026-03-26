@@ -16,19 +16,19 @@ logger = logging.getLogger(__name__)
 
 def _build_prefix(state: dict) -> str:
     """Build the hardcoded variable prefix."""
-    workspace = state["workspace_dir"]
-    competition_dir = state["competition_dir"]
+    workspace = Path(state["workspace_dir"]).resolve()
+    competition_dir = Path(state["competition_dir"]).resolve()
     target_column = state["target_column"]
 
     return (
         "# === INJECTED BY EXECUTOR (do not modify) ===\n"
         "import warnings; warnings.filterwarnings('ignore')\n"
-        f"TRAIN_INPUT = '{Path(competition_dir) / 'train.csv'}'\n"
-        f"TEST_INPUT = '{Path(competition_dir) / 'test.csv'}'\n"
-        f"TRAIN_OUTPUT = '{Path(workspace) / 'cleaned_train.csv'}'\n"
-        f"TEST_OUTPUT = '{Path(workspace) / 'cleaned_test.csv'}'\n"
-        f"SUBMISSION_PATH = '{Path(workspace) / 'submission.csv'}'\n"
-        f"MODEL_PATH = '{Path(workspace) / 'model.pkl'}'\n"
+        f"TRAIN_INPUT = '{competition_dir / 'train.csv'}'\n"
+        f"TEST_INPUT = '{competition_dir / 'test.csv'}'\n"
+        f"TRAIN_OUTPUT = '{workspace / 'cleaned_train.csv'}'\n"
+        f"TEST_OUTPUT = '{workspace / 'cleaned_test.csv'}'\n"
+        f"SUBMISSION_PATH = '{workspace / 'submission.csv'}'\n"
+        f"MODEL_PATH = '{workspace / 'model.pkl'}'\n"
         f"TARGET_COLUMN = '{target_column}'\n"
         "\n"
         "# Safety helper: drop non-numeric columns before model training\n"
